@@ -2,325 +2,179 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.express as px
-import plotly.graph_objects as go
 import re
 
 # ==========================================
 # 1. 스트림릿 페이지 기본 설정
 # ==========================================
 st.set_page_config(
-    page_title="전국 지방소멸 위험지수 타임랩스 대시보드",
-    page_icon="🚨",
+    page_title="우리동네 학령인구 분석기",
+    page_icon="🎒",
     layout="wide"
 )
 
+# 한국어 폰트 설정 (Plotly 등에서 깨짐 방지 - 시스템 폰트 사용)
+# 별도 설정 없이도 스트림릿 클라우드에서는 한글이 잘 나옵니다.
+
 # ==========================================
-# 2. 데이터 로딩 및 전처리 함수
+# 2. 데이터 로딩 및 전처리 (학령인구 특화)
 # ==========================================
 
-# GeoJSON 시군구 경계 데이터 로드
+@st.cache_data(show_spinner="전국 연령별 인구 데이터를 분석 중입니다...")
+def load_education_data():
+    csv_url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/population_yearly.csv.gz"
+    
+    # 1. 데이터 로드 (필요한 열만 패턴으로 읽으면 좋으나 원본 유지)
+    df = pd.read_csv(csv_url, compression='gzip', dtype={'코드': str})
+    
+    # 코드 전처리 및 최신 연도 필터링
+    df['코드'] = df['코드'].str.zfill(10)
+    df['sigungu_code'] = df['코드'].str[:5]
+    latest_year = df['연도'].max()
+    df_latest = df[df['연도'] == latest_year].copy()
+    
+    # 2. 학령인구 열 추출 패턴
+    age_cols_map = {}
+    total_cols = []
+    
+    for col in df_latest.columns:
+        if col.startswith('계_'):
+            total_cols.append(col)
+            match = re.search(r'계_(\d+)세', col)
+            if match:
+                age = int(match.group(1))
+                if 0 <= age <= 18: # 0세부터 18세까지만 추출
+                    age_cols_map[col] = age
+
+    # 3. 데이터 재구조화 (Melt) - 바 차트를 위해 (행정동 단위)
+    df_kids = df_latest[['sigungu_code', '시도', '시군구', '동'] + list(age_cols_map.keys())]
+    df_melt = df_kids.melt(id_vars=['sigungu_code', '시도', '시군구', '동'], var_name='연령_원본', value_name='인구')
+    df_melt['연령'] = df_melt['연령_원본'].map(age_cols_map)
+    
+    # 학령기 구분
+    bins = [-1, 6, 12, 18]
+    labels = ['영유아(0-6)', '초등(7-12)', '중고등(13-18)']
+    df_melt['학령기'] = pd.cut(df_melt['연령'], bins=bins, labels=labels)
+    
+    # 4. 시군구 단위 집계 (지도용)
+    df_sigungu = df_melt.groupby(['sigungu_code', '시도', '시군구', '학령기'])['인구'].sum().reset_index()
+    
+    # 시군구별 총인구 합산 (비율 계산용)
+    df_latest['시군구_총인구'] = df_latest[total_cols].sum(axis=1)
+    df_total_sum = df_latest.groupby('sigungu_code')['시군구_총인구'].sum().reset_index()
+    
+    df_sigungu = pd.merge(df_sigungu, df_total_sum, on='sigungu_code')
+    df_sigungu['비율'] = (df_sigungu['인구'] / df_sigungu['시군구_총인구']) * 100
+    
+    return df_melt, df_sigungu, latest_year
+
 @st.cache_data
 def load_geojson():
     geojson_url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
-    response = requests.get(geojson_url)
-    return response.json()
+    return requests.get(geojson_url).json()
 
-# 전 연도 인구 데이터 로드 및 소멸위험지수 계산
-@st.cache_data
-def load_extinction_data():
-    csv_url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/population_yearly.csv.gz"
-    
-    # 행정동 코드를 10자리 문자열로 유보하여 읽기
-    df = pd.read_csv(csv_url, compression='gzip', dtype={'코드': str})
-    df['코드'] = df['코드'].astype(str).str.zfill(10)
-    df['sigungu_code'] = df['코드'].str[:5]
-    
-    # 1. 열 분류 (전체 인구, 20~39세 여성, 65세 이상 전체)
-    total_cols = [col for col in df.columns if col.startswith('계_')]
-    
-    # 여성 인구 열 중 20세~39세 열 필터링
-    female_cols = [col for col in df.columns if col.startswith('여_')]
-    female_20_39_cols = []
-    for col in female_cols:
-        match = re.search(r'\d+', col)
-        if match and 20 <= int(match.group()) <= 39:
-            female_20_39_cols.append(col)
-            
-    # 고령 인구 열 중 65세 이상 열 필터링
-    age65_cols = []
-    for col in total_cols:
-        match = re.search(r'\d+', col)
-        if match and int(match.group()) >= 65:
-            age65_cols.append(col)
-            
-    # 2. 읍면동 단위에서 필요한 인구 수 합산
-    df['총인구'] = df[total_cols].sum(axis=1)
-    df['여성_20_39'] = df[female_20_39_cols].sum(axis=1)
-    df['고령인구_65'] = df[age65_cols].sum(axis=1)
-    
-    # 3. (연도, 시군구) 단위로 그룹화하여 합산
-    grouped = df.groupby(['연도', 'sigungu_code']).agg(
-        시도=('시도', 'first'),
-        시군구=('시군구', 'first'),
-        총인구=('총인구', 'sum'),
-        여성_20_39=('여성_20_39', 'sum'),
-        고령인구_65=('고령인구_65', 'sum')
-    ).reset_index()
-    
-    # 4. 지방소멸위험지수 계산 = (20~39세 여성 인구) / (65세 이상 고령 인구)
-    # 0으로 나누는 오류 방지 (고령인구가 0인 경우 0.0001로 대치)
-    grouped['소멸위험지수'] = grouped['여성_20_39'] / grouped['고령인구_65'].replace(0, 0.0001)
-    grouped['소멸위험지수'] = grouped['소멸위험지수'].round(3)
-    
-    # 5. 소멸위험지수 5단계 위험 등급 분류 (마스다 히로야 기준)
-    bins = [-float('inf'), 0.2, 0.5, 1.0, 1.5, float('inf')]
-    labels = [
-        '소멸고위험 (<0.2)',
-        '소멸위험 (0.2~0.5)',
-        '주의 (0.5~1.0)',
-        '보통 (1.0~1.5)',
-        '소멸저위험 (≥1.5)'
-    ]
-    grouped['위험등급'] = pd.cut(grouped['소멸위험지수'], bins=bins, labels=labels, right=False)
-    
-    # 전체 지역명 결합
-    grouped['지역명'] = grouped['시도'] + ' ' + grouped['시군구']
-    
-    return grouped
-
-# 데이터 로딩
-df_all = load_extinction_data()
+# 데이터 로드
+df_detail, df_map, data_year = load_education_data()
 geojson_data = load_geojson()
 
-# 이용 가능한 연도 목록 추출
-years = sorted(df_all['연도'].unique())
-min_year, max_year = years[0], years[-1]
 
 # ==========================================
-# 3. 사이드바 구성 (연도 선택 컨트롤)
+# 3. 사이드바 검색 및 필터
 # ==========================================
-st.sidebar.title("⚙️ 대시보드 설정")
-st.sidebar.markdown("---")
+st.sidebar.title("🎒 지역 교육 인구 필터")
+st.sidebar.markdown(f"**기준 연도: {data_year}년**")
 
-# 연도 선택 슬라이더
-selected_year = st.sidebar.slider(
-    "📅 분석 연도 선택",
-    min_value=int(min_year),
-    max_value=int(max_year),
-    value=int(max_year),
-    step=1
-)
+# 시도 선택
+sido_list = sorted(df_detail['시도'].unique())
+selected_sido = st.sidebar.selectbox("1️⃣ 시/도 선택", sido_list, index=sido_list.index('서울특별시'))
+
+# 시군구 선택 (시도에 따라 연동)
+sigungu_list = sorted(df_detail[df_detail['시도'] == selected_sido]['시군구'].unique())
+selected_sigungu = st.sidebar.selectbox("2️⃣ 시/군/구 상세 선택", sigungu_list)
 
 st.sidebar.markdown("---")
-st.sidebar.info(
-    "💡 **지방소멸위험지수란?**\n\n"
-    "**`20~39세 여성 인구` ÷ `65세 이상 인구`**\n\n"
-    "- **0.5 미만**: 소멸위험지역\n"
-    "- **0.2 미만**: 소멸고위험지역\n\n"
-    "지수가 낮을수록 인구 감소 및 지자체 소멸 위험이 높음을 의미합니다."
-)
-
-# 선택된 연도 데이터 필터링
-df_year = df_all[df_all['연도'] == selected_year].copy()
+st.sidebar.info("💡 **팁**: 지도의 학령기 탭을 변경하여 지역별 교육 수요를 예측해 보세요.")
 
 # ==========================================
-# 4. 메인 화면 - 헤더 및 핵심 요약 지표
+# 4. 메인 화면 - 상단 바 차트 (상세 분석)
 # ==========================================
-st.title("🚨 전국 지방소멸 위험지수 타임랩스 대시보드")
-st.caption(f"2015년부터 {max_year}년까지 시군구별 소멸위험지수의 변화를 추적합니다.")
-st.markdown("---")
+st.title("🎒 우리동네 학령인구 분석 대시보드")
+st.subheader(f"{selected_sido} {selected_sigungu}의 0세~18세 상세 연령 분포")
 
-# 선택 연도의 요약 통계 계산
-total_sigungu = len(df_year)
-danger_sigungu = len(df_year[df_year['소멸위험지수'] < 0.5])
-high_danger_sigungu = len(df_year[df_year['소멸위험지수'] < 0.2])
-avg_index = df_year['소멸위험지수'].mean()
+# 선택된 지역 데이터 필터링 (동 단위 데이터를 세부 연령별로 합산)
+df_target = df_detail[
+    (df_detail['시도'] == selected_sido) & 
+    (df_detail['시군구'] == selected_sigungu)
+].groupby('연령')['인구'].sum().reset_index()
 
-# 지표 카드 4개 배치
-col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-col_m1.metric("선택 연도", f"{selected_year}년")
-col_m2.metric("전국 평균 소멸위험지수", f"{avg_index:.3f}")
-col_m3.metric(
-    "소멸위험 이하 시군구 (<0.5)",
-    f"{danger_sigungu}개",
-    delta=f"전체의 {danger_sigungu / total_sigungu * 100:.1f}%",
-    delta_color="inverse"
-)
-col_m4.metric(
-    "소멸고위험 시군구 (<0.2)",
-    f"{high_danger_sigungu}개",
-    delta=f"전체의 {high_danger_sigungu / total_sigungu * 100:.1f}%",
-    delta_color="inverse"
-)
+# 학령기 색상 정의
+school_colors = {'영유아(0-6)': '#8dd3c7', '초등(7-12)': '#ffffb3', '중고등(13-18)': '#bebada'}
+# 색상을 입히기 위해 다시 구분
+bins = [-1, 6, 12, 18]
+labels = ['영유아(0-6)', '초등(7-12)', '중고등(13-18)']
+df_target['학령기'] = pd.cut(df_target['연령'], bins=bins, labels=labels)
 
-st.markdown("---")
-
-# ==========================================
-# 5. 단계구분도 지도 시각화
-# ==========================================
-st.subheader(f"🗺️ {selected_year}년 전국 시군구별 소멸위험 지도")
-
-# 위험 단계별 색상 정의 (위험할수록 짙은 붉은색, 안전할수록 파란색)
-color_map = {
-    '소멸고위험 (<0.2)': '#BD0026',    # 진한 붉은색
-    '소멸위험 (0.2~0.5)': '#F03B20',   # 주황빛 붉은색
-    '주의 (0.5~1.0)': '#FEB24C',     # 황토/주황색
-    '보통 (1.0~1.5)': '#74A9CF',     # 연한 파란색
-    '소멸저위험 (≥1.5)': '#0570B0'    # 진한 파란색
-}
-
-category_order = [
-    '소멸고위험 (<0.2)',
-    '소멸위험 (0.2~0.5)',
-    '주의 (0.5~1.0)',
-    '보통 (1.0~1.5)',
-    '소멸저위험 (≥1.5)'
-]
-
-fig_map = px.choropleth(
-    df_year,
-    geojson=geojson_data,
-    locations='sigungu_code',
-    featureidkey="properties.코드",
-    color='위험등급',
-    color_discrete_map=color_map,
-    category_orders={'위험등급': category_order},
-    hover_name='지역명',
-    hover_data={
-        'sigungu_code': False,
-        '시도': True,
-        '시군구': True,
-        '소멸위험지수': ':.3f',
-        '여성_20_39': ':,',
-        '고령인구_65': ':,',
-        '총인구': ':,',
-        '위험등급': False
-    },
-    labels={
-        '시도': '시/도',
-        '시군구': '시/군/구',
-        '소멸위험지수': '소멸위험지수',
-        '여성_20_39': '20~39세 여성인구(명)',
-        '고령인구_65': '65세 이상 인구(명)',
-        '총인구': '총인구(명)',
-        '위험등급': '위험 등급'
-    }
+# 세부 바 차트 생성
+fig_bar = px.bar(
+    df_target,
+    x='연령',
+    y='인구',
+    color='학령기',
+    color_discrete_map=school_colors,
+    text_auto=',d', # 숫자 천단위 콤마
+    title=f"{selected_sigungu} 연령별 인구 현황"
 )
 
-# 타일 배경 숨기기 및 여백 조정
-fig_map.update_geos(fitbounds="locations", visible=False)
-fig_map.update_layout(
-    margin={"r": 0, "t": 10, "l": 0, "b": 0},
-    legend_title_text="소멸위험 등급",
-    height=650
+fig_bar.update_layout(
+    xaxis=dict(tickmode='linear', dtick=1, title="연령 (세)"),
+    yaxis=dict(title="인구 (명)"),
+    showlegend=True,
+    height=350,
+    margin=dict(l=10, r=10, t=40, b=10)
 )
-
-st.plotly_chart(fig_map, use_container_width=True)
+st.plotly_chart(fig_bar, use_container_width=True)
 
 st.markdown("---")
 
 # ==========================================
-# 6. 상위 / 하위 10개 지역 표 출력
+# 5. 메인 화면 - 하단 지도 (전국 비교)
 # ==========================================
-col_left, col_right = st.columns(2)
+st.subheader(f"🗺️ 전국 시군구별 학령기 인구 비율 (%)")
 
-# 소멸위험지수가 가장 낮은 10곳 (가장 위험한 곳)
-bottom10 = df_year.sort_values(by='소멸위험지수', ascending=True).head(10)[
-    ['시도', '시군구', '소멸위험지수', '여성_20_39', '고령인구_65', '총인구']
-].reset_index(drop=True)
-bottom10.index = bottom10.index + 1
+# 지도 위에 표시할 학령기 탭 구성
+tabs = st.tabs(labels)
 
-# 소멸위험지수가 가장 높은 10곳 (가장 안전한/젊은 곳)
-top10 = df_year.sort_values(by='소멸위험지수', ascending=False).head(10)[
-    ['시도', '시군구', '소멸위험지수', '여성_20_39', '고령인구_65', '총인구']
-].reset_index(drop=True)
-top10.index = top10.index + 1
+for i, tab in enumerate(tabs):
+    with tab:
+        current_stage = labels[i]
+        df_map_stage = df_map[df_map['학령기'] == current_stage]
+        
+        # 지도 색상 스케일 정의 (해당 학령기 색상 기반)
+        if i == 0: scale = "Mint"
+        elif i == 1: scale = "YlOrRd"
+        else: scale = "Purples"
+        
+        # 단계구분도 생성
+        fig_map = px.choropleth(
+            df_map_stage,
+            geojson=geojson_data,
+            locations='sigungu_code',
+            featureidkey="properties.코드",
+            color='비율',
+            color_continuous_scale=scale,
+            hover_name='시군구',
+            hover_data={'시도': True, '비율': ':.2f%', '인구': ':,', 'sigungu_code': False},
+            labels={'비율': '비율(%)', '인구': '인구(명)'}
+        )
+        
+        # 지도 스타일 조정
+        fig_map.update_geos(fitbounds="locations", visible=False)
+        fig_map.update_layout(
+            margin={"r": 0, "t": 0, "l": 0, "b": 0},
+            height=550,
+            coloraxis_colorbar=dict(title=f"{current_stage}<br>비율(%)")
+        )
+        
+        st.plotly_chart(fig_map, use_container_width=True, key=f"map_{i}")
 
-with col_left:
-    st.markdown(f"### 🔴 {selected_year}년 소멸위험 가장 심각한 지역 TOP 10")
-    st.dataframe(
-        bottom10,
-        use_container_width=True,
-        column_config={
-            "소멸위험지수": st.column_config.NumberColumn("소멸위험지수", format="%.3f"),
-            "여성_20_39": st.column_config.NumberColumn("20-39세 여성", format="%'d 명"),
-            "고령인구_65": st.column_config.NumberColumn("65세 이상", format="%'d 명"),
-            "총인구": st.column_config.NumberColumn("총인구", format="%'d 명"),
-        }
-    )
-
-with col_right:
-    st.markdown(f"### 🔵 {selected_year}년 소멸위험 가장 낮은(젊은) 지역 TOP 10")
-    st.dataframe(
-        top10,
-        use_container_width=True,
-        column_config={
-            "소멸위험지수": st.column_config.NumberColumn("소멸위험지수", format="%.3f"),
-            "여성_20_39": st.column_config.NumberColumn("20-39세 여성", format="%'d 명"),
-            "고령인구_65": st.column_config.NumberColumn("65세 이상", format="%'d 명"),
-            "총인구": st.column_config.NumberColumn("총인구", format="%'d 명"),
-        }
-    )
-
-st.markdown("---")
-
-# ==========================================
-# 7. 연도별 소멸위험 지역 확산 시계열 차트
-# ==========================================
-st.subheader("📈 연도별 소멸위험 지역(지수 < 0.5) 증가 추이")
-
-# 각 연도별 위험지역 수 집계
-trend_df = df_all.groupby('연도').apply(
-    lambda x: pd.Series({
-        '소멸위험_지역수': (x['소멸위험지수'] < 0.5).sum(),
-        '소멸고위험_지역수': (x['소멸위험지수'] < 0.2).sum(),
-        '전체_시군구수': len(x)
-    })
-).reset_index()
-
-trend_df['소멸위험_비율'] = (trend_df['소멸위험_지역수'] / trend_df['전체_시군구수']) * 100
-
-# Plotly 선 그래프 생성
-fig_trend = go.Figure()
-
-fig_trend.add_trace(go.Scatter(
-    x=trend_df['연도'],
-    y=trend_df['소멸위험_지역수'],
-    mode='lines+markers+text',
-    name='소멸위험 이하 (<0.5)',
-    text=[f"{val}개" for val in trend_df['소멸위험_지역수']],
-    textposition="top center",
-    line=dict(color='#F03B20', width=3),
-    marker=dict(size=8)
-))
-
-fig_trend.add_trace(go.Scatter(
-    x=trend_df['연도'],
-    y=trend_df['소멸고위험_지역수'],
-    mode='lines+markers+text',
-    name='소멸고위험 (<0.2)',
-    text=[f"{val}개" for val in trend_df['소멸고위험_지역수']],
-    textposition="bottom center",
-    line=dict(color='#BD0026', width=3, dash='dash'),
-    marker=dict(size=8)
-))
-
-# 현재 선택된 연도 강조 표시 라인
-fig_trend.add_vline(
-    x=selected_year,
-    line_width=2,
-    line_dash="dot",
-    line_color="gray",
-    annotation_text=f"현재 선택: {selected_year}년",
-    annotation_position="top left"
-)
-
-fig_trend.update_layout(
-    xaxis=dict(title="연도", tickmode='linear'),
-    yaxis=dict(title="시군구 수 (개)"),
-    height=400,
-    margin=dict(l=20, r=20, t=30, b=20),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-)
-
-st.plotly_chart(fig_trend, use_container_width=True)
+st.caption(f"자료 출처: 통계청 연령별 인구 현황 ({data_year}년 기준)")
