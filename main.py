@@ -13,9 +13,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# 한국어 폰트 설정 (Plotly 등에서 깨짐 방지 - 시스템 폰트 사용)
-# 별도 설정 없이도 스트림릿 클라우드에서는 한글이 잘 나옵니다.
-
 # ==========================================
 # 2. 데이터 로딩 및 전처리 (학령인구 특화)
 # ==========================================
@@ -24,7 +21,7 @@ st.set_page_config(
 def load_education_data():
     csv_url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/population_yearly.csv.gz"
     
-    # 1. 데이터 로드 (필요한 열만 패턴으로 읽으면 좋으나 원본 유지)
+    # 1. 데이터 로드
     df = pd.read_csv(csv_url, compression='gzip', dtype={'코드': str})
     
     # 코드 전처리 및 최신 연도 필터링
@@ -33,7 +30,7 @@ def load_education_data():
     latest_year = df['연도'].max()
     df_latest = df[df['연도'] == latest_year].copy()
     
-    # 2. 학령인구 열 추출 패턴
+    # 2. 학령인구(0세~18세) 열 추출
     age_cols_map = {}
     total_cols = []
     
@@ -43,15 +40,15 @@ def load_education_data():
             match = re.search(r'계_(\d+)세', col)
             if match:
                 age = int(match.group(1))
-                if 0 <= age <= 18: # 0세부터 18세까지만 추출
+                if 0 <= age <= 18:  # 0세부터 18세까지만 추출
                     age_cols_map[col] = age
 
-    # 3. 데이터 재구조화 (Melt) - 바 차트를 위해 (행정동 단위)
+    # 3. 데이터 재구조화 (Melt)
     df_kids = df_latest[['sigungu_code', '시도', '시군구', '동'] + list(age_cols_map.keys())]
     df_melt = df_kids.melt(id_vars=['sigungu_code', '시도', '시군구', '동'], var_name='연령_원본', value_name='인구')
     df_melt['연령'] = df_melt['연령_원본'].map(age_cols_map)
     
-    # 학령기 구분
+    # 학령기 구분 (영유아 / 초등 / 중고등)
     bins = [-1, 6, 12, 18]
     labels = ['영유아(0-6)', '초등(7-12)', '중고등(13-18)']
     df_melt['학령기'] = pd.cut(df_melt['연령'], bins=bins, labels=labels)
@@ -73,55 +70,57 @@ def load_geojson():
     geojson_url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
     return requests.get(geojson_url).json()
 
-# 데이터 로드
+# 데이터 로드 실행
 df_detail, df_map, data_year = load_education_data()
 geojson_data = load_geojson()
 
 
 # ==========================================
-# 3. 사이드바 검색 및 필터
+# 3. 사이드바 검색 및 필터 (기본값: 제주특별자치도 제주시)
 # ==========================================
 st.sidebar.title("🎒 지역 교육 인구 필터")
 st.sidebar.markdown(f"**기준 연도: {data_year}년**")
 
-# 시도 선택
+# 1) 시/도 선택 ('제주특별자치도'를 기본 선택)
 sido_list = sorted(df_detail['시도'].unique())
-selected_sido = st.sidebar.selectbox("1️⃣ 시/도 선택", sido_list, index=sido_list.index('서울특별시'))
+default_sido_index = sido_list.index('제주특별자치도') if '제주특별자치도' in sido_list else 0
+selected_sido = st.sidebar.selectbox("1️⃣ 시/도 선택", sido_list, index=default_sido_index)
 
-# 시군구 선택 (시도에 따라 연동)
+# 2) 시/군/구 선택 ('제주시'를 기본 선택)
 sigungu_list = sorted(df_detail[df_detail['시도'] == selected_sido]['시군구'].unique())
-selected_sigungu = st.sidebar.selectbox("2️⃣ 시/군/구 상세 선택", sigungu_list)
+default_sigungu_index = sigungu_list.index('제주시') if '제주시' in sigungu_list else 0
+selected_sigungu = st.sidebar.selectbox("2️⃣ 시/군/구 상세 선택", sigungu_list, index=default_sigungu_index)
 
 st.sidebar.markdown("---")
 st.sidebar.info("💡 **팁**: 지도의 학령기 탭을 변경하여 지역별 교육 수요를 예측해 보세요.")
 
+
 # ==========================================
-# 4. 메인 화면 - 상단 바 차트 (상세 분석)
+# 4. 메인 화면 - 선택 지역 세부 연령 분포
 # ==========================================
 st.title("🎒 우리동네 학령인구 분석 대시보드")
 st.subheader(f"{selected_sido} {selected_sigungu}의 0세~18세 상세 연령 분포")
 
-# 선택된 지역 데이터 필터링 (동 단위 데이터를 세부 연령별로 합산)
+# 선택된 지역 데이터 필터링 및 연령별 합산
 df_target = df_detail[
     (df_detail['시도'] == selected_sido) & 
     (df_detail['시군구'] == selected_sigungu)
 ].groupby('연령')['인구'].sum().reset_index()
 
-# 학령기 색상 정의
+# 학령기 색상 매핑
 school_colors = {'영유아(0-6)': '#8dd3c7', '초등(7-12)': '#ffffb3', '중고등(13-18)': '#bebada'}
-# 색상을 입히기 위해 다시 구분
 bins = [-1, 6, 12, 18]
 labels = ['영유아(0-6)', '초등(7-12)', '중고등(13-18)']
 df_target['학령기'] = pd.cut(df_target['연령'], bins=bins, labels=labels)
 
-# 세부 바 차트 생성
+# 세부 연령 바 차트 생성
 fig_bar = px.bar(
     df_target,
     x='연령',
     y='인구',
     color='학령기',
     color_discrete_map=school_colors,
-    text_auto=',d', # 숫자 천단위 콤마
+    text_auto=',d',  # 천단위 콤마 표기
     title=f"{selected_sigungu} 연령별 인구 현황"
 )
 
@@ -136,12 +135,13 @@ st.plotly_chart(fig_bar, use_container_width=True)
 
 st.markdown("---")
 
-# ==========================================
-# 5. 메인 화면 - 하단 지도 (전국 비교)
-# ==========================================
-st.subheader(f"🗺️ 전국 시군구별 학령기 인구 비율 (%)")
 
-# 지도 위에 표시할 학령기 탭 구성
+# ==========================================
+# 5. 메인 화면 - 하단 전국 지도 비교
+# ==========================================
+st.subheader("🗺️ 전국 시군구별 학령기 인구 비율 (%)")
+
+# 탭을 통해 학령기별 지도 전환
 tabs = st.tabs(labels)
 
 for i, tab in enumerate(tabs):
@@ -149,7 +149,7 @@ for i, tab in enumerate(tabs):
         current_stage = labels[i]
         df_map_stage = df_map[df_map['학령기'] == current_stage]
         
-        # 지도 색상 스케일 정의 (해당 학령기 색상 기반)
+        # 학령기별 지도 테마 색상 지정
         if i == 0: scale = "Mint"
         elif i == 1: scale = "YlOrRd"
         else: scale = "Purples"
@@ -167,7 +167,7 @@ for i, tab in enumerate(tabs):
             labels={'비율': '비율(%)', '인구': '인구(명)'}
         )
         
-        # 지도 스타일 조정
+        # 지도 스타일 및 크기 설정
         fig_map.update_geos(fitbounds="locations", visible=False)
         fig_map.update_layout(
             margin={"r": 0, "t": 0, "l": 0, "b": 0},
